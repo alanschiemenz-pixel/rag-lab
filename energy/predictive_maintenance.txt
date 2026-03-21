@@ -1,0 +1,5 @@
+Predictive maintenance in the energy sector uses sensor data and ML models to forecast
+equipment failures before they occur. Key techniques include vibration analysis, thermal
+imaging, and time-series anomaly detection. Companies using predictive maintenance report
+20-30% reductions in unplanned downtime and up to 40% lower maintenance costs compared
+to reactive approaches.

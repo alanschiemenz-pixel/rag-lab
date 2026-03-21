@@ -1,0 +1,4 @@
+ESG reporting in energy companies is increasingly automated using AI. Large language models
+extract emissions data from operational reports, normalize units across facilities, and
+generate draft disclosures aligned to GRI and SASB frameworks. Computer vision models
+analyze satellite imagery to monitor environmental impact on extraction sites.

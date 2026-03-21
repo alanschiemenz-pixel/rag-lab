@@ -1,0 +1,5 @@
+Asset integrity management in pipelines and offshore platforms increasingly uses AI.
+Drone-mounted cameras feed computer vision models that detect corrosion, cracks, and
+coating degradation. Digital twin models simulate asset behavior under varying conditions
+to prioritize inspection and maintenance activities. AI-based integrity programs have
+reduced pipeline inspection costs by 40% while improving defect detection rates.

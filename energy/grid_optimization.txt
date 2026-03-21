@@ -1,0 +1,5 @@
+AI-driven grid optimization uses reinforcement learning to balance supply and demand in
+real time across electricity networks. As renewable energy sources like wind and solar
+introduce intermittency, ML models forecast generation output up to 72 hours ahead using
+weather data. Utilities using AI grid management report 15-25% reductions in curtailment
+and improved renewable integration capacity.

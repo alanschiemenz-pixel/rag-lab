@@ -1,0 +1,5 @@
+Health, safety, and environment (HSE) management in the energy sector is being transformed
+by AI. Computer vision systems analyze live CCTV feeds on drilling rigs to detect unsafe
+behaviors such as missing PPE or proximity violations in real time. NLP models process
+incident reports to identify root causes and predict future risk. Companies report 30-50%
+reductions in recordable incidents after deploying AI-based HSE monitoring systems.

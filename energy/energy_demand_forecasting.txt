@@ -1,0 +1,6 @@
+AI demand forecasting models enable utilities and energy retailers to predict electricity
+consumption at the building, neighborhood, and grid level. LSTM neural networks process
+historical consumption, weather, time-of-day, and economic indicators to generate
+probabilistic forecasts. Accurate demand forecasting reduces energy imbalance costs and
+enables more efficient dispatch of generation assets, with leading utilities reporting
+forecast errors below 2% for day-ahead predictions.

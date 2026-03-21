@@ -6,6 +6,7 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential
+from duckduckgo_search import DDGS
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ search_client = SearchClient(
     index_name=os.getenv("AZURE_SEARCH_INDEX"),
     credential=search_credential
 )
+
 
 # ── Security: Input Sanitization ──────────────────────────────────────────────
 def sanitize_input(text: str) -> str:
@@ -73,21 +75,51 @@ def retrieve_context(question: str, top_k: int = 3) -> str:
         chunks = [f"[Source: {r['filename']}]\n{r['content']}" for r in results]
     return "\n\n".join(chunks)
 
+def search_web(query: str, top_k: int = 3) -> str:
+    """Search the web via DuckDuckGo and return top result snippets as context."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=top_k))
+        if not results:
+            return ""
+        chunks = [
+            f"[Web source: {r.get('href', '')}]\n{r.get('body', '')}"
+            for r in results
+        ]
+        return "\n\n".join(chunks)
+    except Exception as e:
+        print(f"Web search failed: {e}")
+        return ""  # fail silently — falls back to PDF context only
+
 # ── Chat: Ground GPT in retrieved context only ────────────────────────────────
 def respond(message: str, history: list) -> str:
     safe_message = sanitize_input(message)
-    context = retrieve_context(safe_message)
 
-    industry = "trail running"
-    #industry = "energy sector consulting"
+    # Retrieve from both sources
+    pdf_context = retrieve_context(safe_message)
+    web_context = search_web(safe_message)
+
+    # Merge contexts, clearly labelled so the LLM knows what came from where
+    combined_context = ""
+    if pdf_context:
+        combined_context += "=== KNOWLEDGE BASE (PDFs) ===\n" + pdf_context
+    if web_context:
+        combined_context += "\n\n=== WEB SEARCH RESULTS ===\n" + web_context
+    if not combined_context:
+        combined_context = "No context found from either source."
+
     system_prompt = (
-        f"You are an expert AI assistant for {industry}.\n"
-        "Answer questions using ONLY the context documents provided below.\n"
-        "Always cite the source document filename in your answer.\n"
-        "If the context does not contain enough information to answer, "
-        "say clearly: I do not have information on that topic in my knowledge base.\n"
-        "Do not use any outside knowledge or make things up.\n\n"
-        "CONTEXT DOCUMENTS:\n" + context
+        "You are an expert AI assistant.\n"
+        "You have been provided two types of context: internal knowledge base "
+        "documents (PDFs) and live web search results.\n"
+        "Prioritize the knowledge base for proprietary or detailed information. "
+        "Use web results for current events, news, or topics not covered in "
+        "the knowledge base.\n"
+        "Always cite your source — either the PDF filename and page number, "
+        "or the web URL.\n"
+        "If neither source contains enough information, say so clearly.\n"
+        "Do not make things up.\n\n"
+        "CONTEXT:\n" + combined_context
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -96,17 +128,20 @@ def respond(message: str, history: list) -> str:
             messages.append({"role": entry["role"], "content": entry["content"]})
         else:
             human_msg, assistant_msg = entry
-            messages.append({"role": "user", "content": human_msg})
-            messages.append({"role": "assistant", "content": assistant_msg})
+            if human_msg:
+                messages.append({"role": "user", "content": human_msg})
+            if assistant_msg:
+                messages.append({"role": "assistant", "content": assistant_msg})
     messages.append({"role": "user", "content": safe_message})
 
     response = openai_client.chat.completions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
         messages=messages,
-        temperature=0.3,   # low = factual, reduces hallucination
+        temperature=0.3,
         max_tokens=600
     )
     return response.choices[0].message.content
+
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 energy_description = (

@@ -17,7 +17,6 @@ openai_client = AzureOpenAI(
     api_version="2024-02-01"
 )
 
-# Security: Managed Identity in production, API key locally
 if os.getenv("USE_MANAGED_IDENTITY") == "true":
     search_credential = DefaultAzureCredential()
 else:
@@ -28,7 +27,6 @@ search_client = SearchClient(
     index_name=os.getenv("AZURE_SEARCH_INDEX"),
     credential=search_credential
 )
-
 
 # ── Security: Input Sanitization ──────────────────────────────────────────────
 def sanitize_input(text: str) -> str:
@@ -42,11 +40,10 @@ def sanitize_input(text: str) -> str:
     ]
     if any(phrase in text.lower() for phrase in forbidden):
         return "[Input blocked: potential prompt injection detected]"
-    return text[:1000]  # cap input length to prevent token flooding
+    return text[:1000]
 
-# ── RAG: Retrieve semantically relevant context ────────────────────────────────
+# ── RAG: Retrieve from PDF index ──────────────────────────────────────────────
 def retrieve_context(question: str, top_k: int = 3) -> str:
-    # Embed the question using the same model used to embed documents
     response = openai_client.embeddings.create(
         input=question,
         model=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
@@ -56,27 +53,19 @@ def retrieve_context(question: str, top_k: int = 3) -> str:
         k_nearest_neighbors=top_k,
         fields="embedding"
     )
-    try:
-        results = search_client.search(
-            search_text=None,
-            vector_queries=[vector_query],
-            select=["content", "filename","page"]
-        )
-        chunks = [
+    results = search_client.search(
+        search_text=None,
+        vector_queries=[vector_query],
+        select=["content", "filename", "page"]
+    )
+    chunks = [
         f"[Source: {r['filename']}, page {r['page']}]\n{r['content']}"
         for r in results
-        ]
-    except:
-        results = search_client.search(
-            search_text=None,
-            vector_queries=[vector_query],
-            select=["content", "filename"]
-        )
-        chunks = [f"[Source: {r['filename']}]\n{r['content']}" for r in results]
+    ]
     return "\n\n".join(chunks)
 
+# ── Web Search: DuckDuckGo ────────────────────────────────────────────────────
 def search_web(query: str, top_k: int = 3) -> str:
-    """Search the web via DuckDuckGo and return top result snippets as context."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=top_k))
@@ -89,92 +78,136 @@ def search_web(query: str, top_k: int = 3) -> str:
         return "\n\n".join(chunks)
     except Exception as e:
         print(f"Web search failed: {e}")
-        return ""  # fail silently — falls back to PDF context only
+        return ""
 
-# ── Chat: Ground GPT in retrieved context only ────────────────────────────────
-def respond(message: str, history: list) -> str:
+# ── Chat ──────────────────────────────────────────────────────────────────────
+def respond(message: str, history: list, use_web: bool) -> str:
     safe_message = sanitize_input(message)
 
-    # Retrieve from both sources
     pdf_context = retrieve_context(safe_message)
-    web_context = search_web(safe_message)
+    web_context = search_web(safe_message) if use_web else ""
 
-    # Merge contexts, clearly labelled so the LLM knows what came from where
     combined_context = ""
     if pdf_context:
         combined_context += "=== KNOWLEDGE BASE (PDFs) ===\n" + pdf_context
     if web_context:
         combined_context += "\n\n=== WEB SEARCH RESULTS ===\n" + web_context
-    if not combined_context:
-        combined_context = "No context found from either source."
 
-    system_prompt = (
-        "You are an expert AI assistant.\n"
-        "You have been provided two types of context: internal knowledge base "
-        "documents (PDFs) and live web search results.\n"
-        "Prioritize the knowledge base for proprietary or detailed information. "
-        "Use web results for current events, news, or topics not covered in "
-        "the knowledge base.\n"
-        "Always cite your source — either the PDF filename and page number, "
-        "or the web URL.\n"
-        "If neither source contains enough information, say so clearly.\n"
-        "Do not make things up.\n\n"
-        "CONTEXT:\n" + combined_context
-    )
+    if use_web:
+        # Looser prompt — web search is on, model can synthesise freely
+        system_prompt = (
+            "You are an expert AI assistant.\n"
+            "You have been provided two types of context: internal knowledge base "
+            "documents (PDFs) and live web search results.\n"
+            "Prioritize the knowledge base for proprietary or detailed information. "
+            "Use web results for current events, news, or topics not covered in "
+            "the knowledge base.\n"
+            "Always cite your source — either the PDF filename and page number, "
+            "or the web URL.\n"
+            "If neither source contains enough information, say so clearly.\n"
+            "Do not make things up.\n\n"
+            "CONTEXT:\n" + combined_context
+        )
+    else:
+        # Strict prompt — web search is off, only PDF context is allowed
+        if not combined_context.strip():
+            return (
+                "I cannot answer this — no relevant information was found "
+                "in the knowledge base. Enable web search to broaden my sources."
+            )
+        system_prompt = (
+            "You are an expert AI assistant.\n"
+            "You have access ONLY to the context documents provided below.\n"
+            "You MUST NOT use any knowledge from your training data.\n"
+            "You MUST NOT answer any question that cannot be answered "
+            "from the provided context alone.\n"
+            "If the context does not contain enough information to fully "
+            "answer the question, respond with exactly: "
+            "'I cannot answer this from the available documents.'\n"
+            "Always cite the exact source filename and page number.\n"
+            "Do not speculate. Do not infer beyond what is written.\n\n"
+            "CONTEXT:\n" + combined_context
+        )
 
     messages = [{"role": "system", "content": system_prompt}]
     for entry in history:
-        if isinstance(entry, dict):
-            messages.append({"role": entry["role"], "content": entry["content"]})
-        else:
-            human_msg, assistant_msg = entry
-            if human_msg:
-                messages.append({"role": "user", "content": human_msg})
-            if assistant_msg:
-                messages.append({"role": "assistant", "content": assistant_msg})
+        messages.append({"role": entry["role"], "content": entry["content"]})
     messages.append({"role": "user", "content": safe_message})
 
     response = openai_client.chat.completions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
         messages=messages,
-        temperature=0.3,
+        temperature=0.3 if use_web else 0,
         max_tokens=600
     )
     return response.choices[0].message.content
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
-energy_description = (
-        "Ask questions about AI applications in the energy sector. "
-        "Powered by Azure OpenAI (GPT-4o-mini) and Azure AI Search (vector RAG). "
-        "Answers are grounded in the knowledge base only — no hallucination."
-    ),
-running_description = (
-        "Ask questions about trail running. "
-        "Powered by Azure OpenAI (GPT-4o-mini) and Azure AI Search (vector RAG). "
-        "Answers are grounded in the knowledge base only — no hallucination."
-    )
-energy_examples = [
-        "What cost savings does predictive maintenance deliver in energy?",
-        "How is AI used in HSE safety monitoring on drilling rigs?",
-        "What AI techniques are used to optimize oil and gas drilling?",
-        "How does AI improve grid management with renewable energy?",
-        "How is AI accelerating carbon capture and storage?",
-        "What AI methods are used for pipeline asset integrity?",
+def handle_message(message, history, use_web):
+    if not message.strip():
+        return history, ""
+    answer = respond(message, history, use_web)
+    history = history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": answer}
     ]
-running_examples = [
-        "What races are near Houston, TX in the next 3 months?",
-        "What races are good for beginners?",
-        "Give me a list of all races that have a distance of at least 50 miles"]
+    return history, ""
 
-energy_title = "Energy AI Assistant"  
-running_title = "Race calendar AI Assistant"  
-demo = gr.ChatInterface(
-    fn=respond,
-    title=running_title,
-    description=running_description,
-    examples=running_examples,
-)
+
+with gr.Blocks(title="Trail racing AI Assistant") as demo:
+    gr.Markdown("## Trail racing AI Assistant")
+    gr.Markdown(
+        "Ask questions about your documents or the web. "
+        "Click an example or type your own question below."
+    )
+
+    with gr.Row():
+        web_toggle = gr.Checkbox(
+            label="Enable web search",
+            value=True
+        )
+
+    chatbot = gr.Chatbot(height=500)
+
+    with gr.Row():
+        msg = gr.Textbox(
+            placeholder="Ask a question...",
+            label="",
+            scale=9,
+            lines=1
+        )
+        submit_btn = gr.Button("Send", variant="primary", scale=1)
+
+    gr.Examples(
+        examples=[
+            ["What races are near Houston in the next 3 months?"],
+            ["What is the hardest race you know about?"],
+            ["Show me all races that are at least 50 miles or longer"],
+            ["What are the best trail race shoes?"]
+        ],
+        inputs=[msg],
+        label="Example questions"
+    )
+
+    clear_btn = gr.Button("Clear conversation")
+
+    submit_btn.click(
+        handle_message,
+        inputs=[msg, chatbot, web_toggle],
+        outputs=[chatbot, msg]
+    )
+    msg.submit(
+        handle_message,
+        inputs=[msg, chatbot, web_toggle],
+        outputs=[chatbot, msg]
+    )
+    clear_btn.click(
+        lambda: ([], ""),
+        outputs=[chatbot, msg]
+    )
+
 
 if __name__ == "__main__":
-    demo.launch(share=True)
+    demo.launch()
+    

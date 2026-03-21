@@ -132,7 +132,7 @@ running_examples = [
         "What races are good for beginners?",
         "Give me a list of all races that have a distance of at least 50 miles"]
 
-energy_title = "Energy AI Assistant"  # Change to "Trail Running AI Assistant" for running context
+energy_title = "Energy AI Assistant"  
 running_title = "Race calendar AI Assistant"  
 demo = gr.ChatInterface(
     fn=respond,

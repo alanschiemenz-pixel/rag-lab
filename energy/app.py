@@ -181,10 +181,10 @@ with gr.Blocks(title="Energy AI Assistant") as demo:
 
     gr.Examples(
         examples=[
-            ["What races are near Houston in the next 3 months?"],
-            ["What is the hardest race you know about?"],
-            ["Show me all races that are at least 50 miles or longer"],
-            ["What are the best trail race shoes?"]
+            ["How is AI being utilized to improve energy transmission infrastructure and support the clean energy transition?"],
+            ["What are the key risks and challenges associated with deploying generative AI in the energy and materials sectors, and how can they be mitigated?"],
+            ["How is the growth of sustainable financing, such as green bonds, influencing investments in energy transition technologies?"],
+            ["What are the power and compute demands of large AI models, and how are major companies scaling their data centers to meet these needs?"]
         ],
         inputs=[msg],
         label="Example questions"

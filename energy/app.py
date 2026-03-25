@@ -1,31 +1,40 @@
-import gradio as gr
 import os
 from dotenv import load_dotenv
-from openai import AzureOpenAI
-from azure.search.documents import SearchClient
-from azure.search.documents.models import VectorizedQuery
-from azure.core.credentials import AzureKeyCredential
-from azure.identity import DefaultAzureCredential
+
+load_dotenv()  # must run before LangChain imports — sets AZURESEARCH_FIELDS_CONTENT_VECTOR
+
+import gradio as gr
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+from langchain_community.vectorstores import AzureSearch
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from duckduckgo_search import DDGS
 
-load_dotenv()
-
-# ── Clients ───────────────────────────────────────────────────────────────────
-openai_client = AzureOpenAI(
+# ── LangChain clients ──────────────────────────────────────────────────────────
+embeddings = AzureOpenAIEmbeddings(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
     api_version="2024-02-01"
 )
 
-if os.getenv("USE_MANAGED_IDENTITY") == "true":
-    search_credential = DefaultAzureCredential()
-else:
-    search_credential = AzureKeyCredential(os.getenv("AZURE_SEARCH_KEY"))
+llm = AzureChatOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    api_version="2024-02-01",
+    max_tokens=600
+)
 
-search_client = SearchClient(
-    endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
+search_key = (
+    None if os.getenv("USE_MANAGED_IDENTITY") == "true"
+    else os.getenv("AZURE_SEARCH_KEY")
+)
+
+vector_store = AzureSearch(
+    azure_search_endpoint=os.getenv("AZURE_SEARCH_ENDPOINT"),
+    azure_search_key=search_key,
     index_name=os.getenv("AZURE_SEARCH_INDEX"),
-    credential=search_credential
+    embedding_function=embeddings.embed_query
 )
 
 # ── Security: Input Sanitization ──────────────────────────────────────────────
@@ -44,23 +53,10 @@ def sanitize_input(text: str) -> str:
 
 # ── RAG: Retrieve from PDF index ──────────────────────────────────────────────
 def retrieve_context(question: str, top_k: int = 3) -> str:
-    response = openai_client.embeddings.create(
-        input=question,
-        model=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
-    )
-    vector_query = VectorizedQuery(
-        vector=response.data[0].embedding,
-        k_nearest_neighbors=top_k,
-        fields="embedding"
-    )
-    results = search_client.search(
-        search_text=None,
-        vector_queries=[vector_query],
-        select=["content", "filename", "page"]
-    )
+    docs = vector_store.similarity_search(question, k=top_k)
     chunks = [
-        f"[Source: {r['filename']}, page {r['page']}]\n{r['content']}"
-        for r in results
+        f"[Source: {doc.metadata.get('filename', 'unknown')}, page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
+        for doc in docs
     ]
     return "\n\n".join(chunks)
 
@@ -129,18 +125,16 @@ def respond(message: str, history: list, use_web: bool) -> str:
             "CONTEXT:\n" + combined_context
         )
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [SystemMessage(content=system_prompt)]
     for entry in history:
-        messages.append({"role": entry["role"], "content": entry["content"]})
-    messages.append({"role": "user", "content": safe_message})
+        if entry["role"] == "user":
+            messages.append(HumanMessage(content=entry["content"]))
+        else:
+            messages.append(AIMessage(content=entry["content"]))
+    messages.append(HumanMessage(content=safe_message))
 
-    response = openai_client.chat.completions.create(
-        model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-        messages=messages,
-        temperature=0.3 if use_web else 0,
-        max_tokens=600
-    )
-    return response.choices[0].message.content
+    response = llm.invoke(messages, temperature=0.3 if use_web else 0)
+    return response.content
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
@@ -210,4 +204,3 @@ with gr.Blocks(title="Energy AI Assistant") as demo:
 
 if __name__ == "__main__":
     demo.launch(share=True)
-    

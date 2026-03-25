@@ -108,30 +108,35 @@ agent_web = create_react_agent(
 )
 
 # ── Chat ───────────────────────────────────────────────────────────────────────
-def respond(message: str, history: list, use_web: bool) -> str:
-    safe_message = sanitize_input(message)
-
-    messages = []
-    for entry in history:
-        if entry["role"] == "user":
-            messages.append(HumanMessage(content=entry["content"]))
-        else:
-            messages.append(AIMessage(content=entry["content"]))
-    messages.append(HumanMessage(content=safe_message))
-
-    agent = agent_web if use_web else agent_strict
-    result = agent.invoke({"messages": messages})
-    return result["messages"][-1].content
-# ── Gradio UI ─────────────────────────────────────────────────────────────────
 def handle_message(message, history, use_web):
     if not message.strip():
-        return history, ""
-    answer = respond(message, history, use_web)
+        yield history, ""
+        return
+
+    safe_message = sanitize_input(message)
+
+    lc_messages = []
+    for entry in history:
+        if entry["role"] == "user":
+            lc_messages.append(HumanMessage(content=entry["content"]))
+        else:
+            lc_messages.append(AIMessage(content=entry["content"]))
+    lc_messages.append(HumanMessage(content=safe_message))
+
+    agent = agent_web if use_web else agent_strict
     history = history + [
         {"role": "user", "content": message},
-        {"role": "assistant", "content": answer}
+        {"role": "assistant", "content": ""},
     ]
-    return history, ""
+
+    partial = ""
+    for chunk, metadata in agent.stream(
+        {"messages": lc_messages}, stream_mode="messages"
+    ):
+        if chunk.content and metadata.get("langgraph_node") == "agent":
+            partial += chunk.content
+            history[-1] = {"role": "assistant", "content": partial}
+            yield history, ""
 
 
 with gr.Blocks(title="Energy AI Assistant") as demo:

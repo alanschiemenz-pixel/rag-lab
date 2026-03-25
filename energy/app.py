@@ -8,6 +8,8 @@ from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langchain_community.vectorstores import AzureSearch
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from duckduckgo_search import DDGS
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 
 # ── LangChain clients ──────────────────────────────────────────────────────────
 embeddings = AzureOpenAIEmbeddings(
@@ -51,81 +53,65 @@ def sanitize_input(text: str) -> str:
         return "[Input blocked: potential prompt injection detected]"
     return text[:1000]
 
-# ── RAG: Retrieve from PDF index ──────────────────────────────────────────────
-def retrieve_context(question: str, top_k: int = 3) -> str:
-    docs = vector_store.similarity_search(question, k=top_k)
-    chunks = [
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+@tool
+def search_knowledge_base(query: str) -> str:
+    """Search the internal PDF knowledge base for energy topics."""
+    docs = vector_store.similarity_search(query, k=3)
+    if not docs:
+        return "No relevant documents found."
+    return "\n\n".join(
         f"[Source: {doc.metadata.get('filename', 'unknown')}, page {doc.metadata.get('page', '?')}]\n{doc.page_content}"
         for doc in docs
-    ]
-    return "\n\n".join(chunks)
+    )
 
-# ── Web Search: DuckDuckGo ────────────────────────────────────────────────────
-def search_web(query: str, top_k: int = 3) -> str:
+@tool
+def search_web(query: str) -> str:
+    """Search the web via DuckDuckGo for current information."""
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=top_k))
+            results = list(ddgs.text(query, max_results=3))
         if not results:
-            return ""
-        chunks = [
+            return "No web results found."
+        return "\n\n".join(
             f"[Web source: {r.get('href', '')}]\n{r.get('body', '')}"
             for r in results
-        ]
-        return "\n\n".join(chunks)
+        )
     except Exception as e:
-        print(f"Web search failed: {e}")
-        return ""
+        return f"Web search failed: {e}"
 
-# ── Chat ──────────────────────────────────────────────────────────────────────
+
+# ── Agents ─────────────────────────────────────────────────────────────────────
+PROMPT_STRICT = (
+    "You are an expert AI assistant. "
+    "You MUST only use the search_knowledge_base tool to answer questions. "
+    "Do NOT use any training knowledge. "
+    "If the knowledge base lacks enough information, say: "
+    "'I cannot answer this from the available documents.' "
+    "Always cite the exact source filename and page number."
+)
+
+PROMPT_WEB = (
+    "You are an expert AI assistant. "
+    "Use search_knowledge_base for proprietary or detailed information, "
+    "and search_web for current events or topics not in the knowledge base. "
+    "Always cite your source — PDF filename and page, or web URL. "
+    "If neither source has enough information, say so clearly."
+)
+
+agent_strict = create_react_agent(
+    llm.bind(temperature=0), tools=[search_knowledge_base], prompt=PROMPT_STRICT
+)
+agent_web = create_react_agent(
+    llm.bind(temperature=0.3), tools=[search_knowledge_base, search_web], prompt=PROMPT_WEB
+)
+
+# ── Chat ───────────────────────────────────────────────────────────────────────
 def respond(message: str, history: list, use_web: bool) -> str:
     safe_message = sanitize_input(message)
 
-    pdf_context = retrieve_context(safe_message)
-    web_context = search_web(safe_message) if use_web else ""
-
-    combined_context = ""
-    if pdf_context:
-        combined_context += "=== KNOWLEDGE BASE (PDFs) ===\n" + pdf_context
-    if web_context:
-        combined_context += "\n\n=== WEB SEARCH RESULTS ===\n" + web_context
-
-    if use_web:
-        # Looser prompt — web search is on, model can synthesise freely
-        system_prompt = (
-            "You are an expert AI assistant.\n"
-            "You have been provided two types of context: internal knowledge base "
-            "documents (PDFs) and live web search results.\n"
-            "Prioritize the knowledge base for proprietary or detailed information. "
-            "Use web results for current events, news, or topics not covered in "
-            "the knowledge base.\n"
-            "Always cite your source — either the PDF filename and page number, "
-            "or the web URL.\n"
-            "If neither source contains enough information, say so clearly.\n"
-            "Do not make things up.\n\n"
-            "CONTEXT:\n" + combined_context
-        )
-    else:
-        # Strict prompt — web search is off, only PDF context is allowed
-        if not combined_context.strip():
-            return (
-                "I cannot answer this — no relevant information was found "
-                "in the knowledge base. Enable web search to broaden my sources."
-            )
-        system_prompt = (
-            "You are an expert AI assistant.\n"
-            "You have access ONLY to the context documents provided below.\n"
-            "You MUST NOT use any knowledge from your training data.\n"
-            "You MUST NOT answer any question that cannot be answered "
-            "from the provided context alone.\n"
-            "If the context does not contain enough information to fully "
-            "answer the question, respond with exactly: "
-            "'I cannot answer this from the available documents.'\n"
-            "Always cite the exact source filename and page number.\n"
-            "Do not speculate. Do not infer beyond what is written.\n\n"
-            "CONTEXT:\n" + combined_context
-        )
-
-    messages = [SystemMessage(content=system_prompt)]
+    messages = []
     for entry in history:
         if entry["role"] == "user":
             messages.append(HumanMessage(content=entry["content"]))
@@ -133,10 +119,9 @@ def respond(message: str, history: list, use_web: bool) -> str:
             messages.append(AIMessage(content=entry["content"]))
     messages.append(HumanMessage(content=safe_message))
 
-    response = llm.invoke(messages, temperature=0.3 if use_web else 0)
-    return response.content
-
-
+    agent = agent_web if use_web else agent_strict
+    result = agent.invoke({"messages": messages})
+    return result["messages"][-1].content
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 def handle_message(message, history, use_web):
     if not message.strip():

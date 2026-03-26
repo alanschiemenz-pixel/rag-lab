@@ -1,0 +1,13 @@
+langchain-anthropic
+langchain-core
+langgraph
+langgraph-prebuilt
+gradio
+gridstatus
+openmeteo-requests
+requests-cache
+retry-requests
+pandas
+numpy
+plotly
+python-dotenv

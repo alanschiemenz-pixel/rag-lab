@@ -204,7 +204,7 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
 
         # ── Tab 1: Chat ───────────────────────────────────────────────────────
         with gr.Tab("Chat"):
-            chatbot = gr.Chatbot(height=480, type="messages")
+            chatbot = gr.Chatbot(height=480)
 
             with gr.Row():
                 msg_box = gr.Textbox(
@@ -216,7 +216,7 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
             with gr.Row():
                 mock_toggle = gr.Checkbox(
                     label="Use mock data (no API keys needed)",
-                    value=not bool(config.ANTHROPIC_API_KEY),
+                    value=not bool(config.AZURE_OPENAI_KEY),
                 )
 
             gr.Examples(

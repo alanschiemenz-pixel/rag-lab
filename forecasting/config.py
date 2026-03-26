@@ -27,5 +27,7 @@ ISO_BASE_LMP = {
 # Set USE_MOCK_DATA=true in .env to force mock data (no API keys needed)
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").lower() == "true"
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+AZURE_OPENAI_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_KEY        = os.getenv("AZURE_OPENAI_KEY", "")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
 PJM_API_KEY = os.getenv("PJM_API_KEY", "")  # Optional — falls back to mock if absent

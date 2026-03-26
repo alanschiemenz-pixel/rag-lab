@@ -1,4 +1,4 @@
-langchain-anthropic
+langchain-openai
 langchain-core
 langgraph
 langgraph-prebuilt

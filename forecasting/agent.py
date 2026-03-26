@@ -1,8 +1,8 @@
 """
-LangGraph agent: Claude + 6 energy-market tools via create_react_agent.
+LangGraph agent: Azure OpenAI + 6 energy-market tools via create_react_agent.
 """
 import os
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import AzureChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 from tools import (
@@ -36,11 +36,13 @@ this compares to PJM?").
 Use metric units internally but present temperatures in °F and prices in $/MWh \
 to match US market conventions."""
 
-_llm = ChatAnthropic(
-    model="claude-sonnet-4-6",
+_llm = AzureChatOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+    api_version="2024-02-01",
     temperature=0,
     max_tokens=2048,
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
 
 _tools = [

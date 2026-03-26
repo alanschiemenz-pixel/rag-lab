@@ -62,9 +62,10 @@ def _fit_lmp_model(merged: pd.DataFrame):
     return coef
 
 
-def _predict_lmp(coef, temp: np.ndarray, hours: pd.DatetimeIndex) -> np.ndarray:
-    h   = hours.hour.values
-    mon = hours.month.values
+def _predict_lmp(coef, temp: np.ndarray, hours) -> np.ndarray:
+    hours = pd.DatetimeIndex(hours)
+    h   = hours.hour
+    mon = hours.month
     X = np.column_stack([
         np.ones(len(temp)),
         temp,

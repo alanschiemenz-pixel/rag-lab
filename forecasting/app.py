@@ -51,7 +51,7 @@ def handle_chat(message: str, history: list, mock_toggle: bool) -> tuple:
     for chunk, metadata in agent.stream(
         {"messages": lc_messages}, stream_mode="messages"
     ):
-        if chunk.content and metadata.get("langgraph_node") == "agent":
+        if chunk.content and metadata.get("langgraph_node") == "model":
             partial += chunk.content
             history[-1] = {"role": "assistant", "content": partial}
             yield history, ""

@@ -3,7 +3,7 @@ LangGraph agent: Azure OpenAI + 6 energy-market tools via create_react_agent.
 """
 import os
 from langchain_openai import AzureChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 from tools import (
     get_lmp_data,
@@ -54,4 +54,4 @@ _tools = [
     compare_markets,
 ]
 
-agent = create_react_agent(_llm, _tools, prompt=SYSTEM_PROMPT)
+agent = create_agent(_llm, _tools, system_prompt=SYSTEM_PROMPT)

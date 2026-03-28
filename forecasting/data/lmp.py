@@ -68,11 +68,7 @@ def _real_ercot(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Fetch ERCOT day-ahead hourly LMP via gridstatus (no API key required)."""
     import gridstatus
     iso = gridstatus.Ercot()
-    frames = []
-    for day in pd.date_range(start.date(), end.date(), freq="D"):
-        df = iso.get_lmp(date=day.date(), market="DAY_AHEAD_HOURLY")
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
+    df = iso.get_lmp(date=start.date(), end=end.date(), market="DAY_AHEAD_HOURLY")
     return _normalize(df, "ERCOT")
 
 
@@ -85,38 +81,42 @@ def _real_pjm(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         raise ValueError("PJM_API_KEY not set")
     import gridstatus
     iso = gridstatus.PJM(api_key=config.PJM_API_KEY)
-    frames = []
-    for day in pd.date_range(start.date(), end.date(), freq="D"):
-        df = iso.get_lmp(date=day.date(), market="DAY_AHEAD_HOURLY",
-                         locations=config.ISO_NODES["PJM"])
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
+    df = iso.get_lmp(date=start.date(), end=end.date(), market="DAY_AHEAD_HOURLY")
     return _normalize(df, "PJM")
 
 
 def _real_spp(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Fetch SPP day-ahead hourly LMP via gridstatus (no API key required)."""
     import gridstatus
-    iso = gridstatus.Spp()
-    frames = []
-    for day in pd.date_range(start.date(), end.date(), freq="D"):
-        df = iso.get_lmp(date=day.date(), market="DAY_AHEAD_HOURLY")
-        frames.append(df)
-    df = pd.concat(frames, ignore_index=True)
+    iso = gridstatus.spp()
+    df = iso.get_lmp(date=start.date(), end=end.date(), market="DAY_AHEAD_HOURLY")
     return _normalize(df, "SPP")
 
 
 def _normalize(df: pd.DataFrame, iso: str) -> pd.DataFrame:
     """Normalize gridstatus output to the canonical LMP schema."""
-    col_map = {
-        "Time": "Time", "Interval Start": "Time",
-        "Location": "Location", "Location Name": "Location",
-        "LMP": "LMP",
-        "Energy": "Energy",
-        "Congestion": "Congestion",
-        "Loss": "Loss",
-    }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+    # Priority order: first match wins for each target column
+    location_candidates = ["Location Name", "Location", "Location Short Name"]
+    time_candidates     = ["Interval Start", "Time"]
+    lmp_candidates      = ["LMP", "LMP Total"]
+
+    def first_present(candidates):
+        return next((c for c in candidates if c in df.columns), None)
+
+    renames = {}
+    if col := first_present(time_candidates):
+        renames[col] = "Time"
+        # Drop any other columns that would collide with the renamed "Time"
+        df = df.drop(columns=[c for c in time_candidates if c != col and c in df.columns])
+    if col := first_present(location_candidates):
+        renames[col] = "Location"
+    if col := first_present(lmp_candidates):
+        renames[col] = "LMP"
+    for c in ["Energy", "Congestion", "Loss"]:
+        if c in df.columns:
+            renames[c] = c
+
+    df = df.rename(columns=renames)
     for col in ["Energy", "Congestion", "Loss"]:
         if col not in df.columns:
             df[col] = np.nan

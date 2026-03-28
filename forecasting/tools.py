@@ -40,7 +40,8 @@ def _date_range_30d() -> tuple[str, str]:
 def _fit_lmp_model(merged: pd.DataFrame):
     """
     Fit a linear regression: LMP ~ temp + temp^2 + hour_sin + hour_cos + month_sin + month_cos
-    Returns (coefficients, feature_builder_fn).
+    Returns (coef, sigma_base) where sigma_base is the std of training residuals —
+    the day-1 uncertainty used for the sqrt(t) confidence interval.
     """
     t    = merged["temperature_2m"].values
     h    = merged["Time"].dt.hour.values
@@ -57,9 +58,9 @@ def _fit_lmp_model(merged: pd.DataFrame):
         np.cos(2 * np.pi * mon / 12),
     ])
 
-    # Least-squares fit via numpy
     coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-    return coef
+    sigma_base = float(np.std(y - X @ coef))
+    return coef, sigma_base
 
 
 def _predict_lmp(coef, temp: np.ndarray, hours) -> np.ndarray:
@@ -177,7 +178,7 @@ def correlate_lmp_weather(iso: str, lookback_days: int = 30) -> str:
 
         # Use first node only for correlation
         node_df = lmp_df[lmp_df["Location"] == lmp_df["Location"].iloc[0]].copy()
-        node_df["time"] = node_df["Time"].dt.floor("h")
+        node_df["time"] = node_df["Time"].dt.tz_localize(None).dt.floor("h") if node_df["Time"].dt.tz is not None else node_df["Time"].dt.floor("h")
         wx_df["time"]   = wx_df["time"].dt.floor("h")
 
         merged = node_df.merge(wx_df, on="time", how="inner")
@@ -274,15 +275,15 @@ def forecast_lmp(iso: str, horizon_days: int = 7) -> str:
         wx_hist = wx_data.weather_for_iso(iso, start_hist, end_hist)
 
         node_df = lmp_df[lmp_df["Location"] == lmp_df["Location"].iloc[0]].copy()
-        node_df["time"] = node_df["Time"].dt.floor("h")
+        node_df["time"] = node_df["Time"].dt.tz_localize(None).dt.floor("h") if node_df["Time"].dt.tz is not None else node_df["Time"].dt.floor("h")
         wx_hist["time"] = wx_hist["time"].dt.floor("h")
         merged = node_df.merge(wx_hist, on="time", how="inner")
 
         if len(merged) < 48:
             return "Insufficient historical data to build forecast model."
 
-        # 2. Fit model
-        coef = _fit_lmp_model(merged)
+        # 2. Fit model + capture residual std for uncertainty bands
+        coef, sigma_base = _fit_lmp_model(merged)
 
         # 3. Get weather forecast
         wx_fcast = wx_data.forecast_for_iso(iso, horizon_days)
@@ -300,19 +301,25 @@ def forecast_lmp(iso: str, horizon_days: int = 7) -> str:
             temp_low=("temperature_2m", "min"),
         ).round(2)
 
+        # 5. Uncertainty: 95% CI grows as 1.96 * sigma_base * sqrt(day_index)
         tag = _source_tag(lmp_df)
-        lines = [
-            f"  {d}: avg ${r.lmp_avg}/MWh  peak ${r.lmp_peak}/MWh  "
-            f"(temp {r.temp_low}–{r.temp_high}°F)"
-            for d, r in daily.iterrows()
-        ]
+        lines = []
+        for day_idx, (d, r) in enumerate(daily.iterrows(), start=1):
+            ci = round(1.96 * sigma_base * np.sqrt(day_idx), 2)
+            lines.append(
+                f"  Day {day_idx:2d} ({d}): avg ${r.lmp_avg}/MWh  "
+                f"95% CI ±${ci}  "
+                f"range [${round(r.lmp_avg - ci, 2)}, ${round(r.lmp_avg + ci, 2)}]  "
+                f"(temp {r.temp_low}-{r.temp_high}°F)"
+            )
 
         return (
             f"{tag}\n"
             f"ISO: {iso} | {horizon_days}-Day LMP Forecast\n"
-            f"Model: linear regression on temperature, hour-of-day, month (trained on {lookback} days)\n\n"
+            f"Model: linear regression | base uncertainty sigma=${sigma_base:.2f}/MWh | "
+            f"CI grows as 1.96*sigma*sqrt(day)\n\n"
             + "\n".join(lines)
-            + "\n\n⚠ Forecast uncertainty is significant beyond 3–5 days. "
+            + "\n\n⚠ Uncertainty widens significantly beyond day 5. "
             "Treat as indicative, not as a trading signal."
         )
     except Exception as e:

@@ -75,15 +75,17 @@ def _mock_weather(lat: float, lon: float, start: date, end: date) -> pd.DataFram
 def _parse_openmeteo(response, start: date, end: date) -> pd.DataFrame:
     """Convert an Open-Meteo response object to a tidy DataFrame."""
     hourly = response.Hourly()
+    # Derive timestamps from the response itself — avoids length mismatches
+    # caused by DST transitions or API rounding of the requested date range.
     hours = pd.date_range(
-        start=pd.Timestamp(start),
-        end=pd.Timestamp(end),
-        freq="h",
+        start=pd.to_datetime(hourly.Time(),    unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(),   unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
         inclusive="left",
-    )
+    ).tz_localize(None)  # drop UTC tz so downstream merges stay tz-naive
     # Variable order must match the request's hourly list
     return pd.DataFrame({
-        "time":           hours[: hourly.Variables(0).ValuesAsNumpy().shape[0]],
+        "time":           hours,
         "temperature_2m": hourly.Variables(0).ValuesAsNumpy().round(1),
         "wind_speed_10m": hourly.Variables(1).ValuesAsNumpy().round(1),
         "precipitation":  hourly.Variables(2).ValuesAsNumpy().round(2),

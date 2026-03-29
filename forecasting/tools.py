@@ -79,6 +79,79 @@ def _predict_lmp(coef, temp: np.ndarray, hours) -> np.ndarray:
     return X @ coef
 
 
+def _aggregate_daily(merged: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate hourly merged LMP+weather DataFrame to daily averages."""
+    daily = (
+        merged.groupby(merged["time"].dt.date)
+        .agg(
+            lmp_avg=("LMP", "mean"),
+            temp_avg=("temperature_2m", "mean"),
+            temp_max=("temperature_2m", "max"),
+        )
+        .reset_index()
+    )
+    daily["time"] = pd.to_datetime(daily["time"])
+    daily = daily.set_index("time").asfreq("D")  # ensure daily frequency for SARIMAX
+    return daily
+
+
+def _fit_arima_model(merged: pd.DataFrame):
+    """
+    Fit a SARIMAX model on daily LMP with temperature as exogenous variables.
+    Model: SARIMAX(1,1,1)(1,0,1,7) — AR(1), differenced, MA(1),
+           seasonal AR/MA at 7-day lag (weekly pattern).
+
+    The target is shifted-log transformed: log(LMP - floor) where
+    floor = min(daily LMP) - 1, guaranteeing the argument is always >= 1
+    before taking the log. This constrains back-transformed forecasts to
+    always be greater than floor (i.e. never cross zero into nonsensical
+    territory), while handling ERCOT negative prices correctly.
+
+    Returns (result, sigma_base, daily_df, floor) where:
+      result     — fitted statsmodels SARIMAXResultsWrapper (log scale)
+      sigma_base — std of in-sample residuals on the log scale
+      daily_df   — the daily training DataFrame (original $/MWh scale)
+      floor      — shift constant; back-transform: exp(pred) + floor
+    """
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    daily = _aggregate_daily(merged)
+
+    # Shifted-log transform so all values are strictly positive before log.
+    # Use floor=0 (pure log) when prices are always positive; only shift
+    # downward when the series contains non-positive values (e.g. ERCOT wind).
+    min_lmp = float(daily["lmp_avg"].min())
+    floor   = 0.0 if min_lmp > 0 else min_lmp - 1.0
+    y_log   = np.log(daily["lmp_avg"] - floor)
+
+    exog = daily[["temp_avg", "temp_max"]]
+
+    model = SARIMAX(
+        y_log,
+        exog=exog,
+        order=(1, 1, 1),
+        seasonal_order=(1, 0, 1, 7),
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    result = model.fit(disp=False, method="lbfgs", maxiter=200)
+    sigma_base = float(np.std(result.resid.dropna()))
+    return result, sigma_base, daily, floor
+
+
+def _predict_arima(result, wx_fcast: pd.DataFrame) -> np.ndarray:
+    """
+    Forecast daily LMP using a fitted SARIMAX result.
+
+    wx_fcast must have columns: time (date index), temp_avg, temp_max.
+    Returns log-scale predictions — caller must back-transform with
+    np.exp(preds) + floor to get $/MWh values.
+    """
+    exog_fcast = wx_fcast[["temp_avg", "temp_max"]]
+    forecast = result.forecast(steps=len(exog_fcast), exog=exog_fcast)
+    return forecast.values  # log scale
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @tool
@@ -251,17 +324,46 @@ def get_weather_forecast(iso: str, forecast_days: int = 7) -> str:
         return f"Error fetching forecast for {iso}: {e}"
 
 
+def _build_hub_merged(lmp_df: pd.DataFrame, hub: str, iso: str,
+                      start_hist: str, end_hist: str) -> pd.DataFrame:
+    """Filter LMP to one hub and merge with hub-specific historical weather."""
+    node_df = lmp_df[lmp_df["Location"] == hub].copy()
+    node_df["time"] = (
+        node_df["Time"].dt.tz_localize(None).dt.floor("h")
+        if node_df["Time"].dt.tz is not None
+        else node_df["Time"].dt.floor("h")
+    )
+    wx = wx_data.weather_for_hub(iso, hub, start_hist, end_hist)
+    wx["time"] = wx["time"].dt.floor("h")
+    return node_df.merge(wx, on="time", how="inner")
+
+
+def _build_hub_fcast_daily(iso: str, hub: str,
+                           horizon_days: int) -> pd.DataFrame:
+    """Aggregate hub-specific hourly weather forecast to daily exog DataFrame."""
+    wx_fcast = wx_data.forecast_for_hub(iso, hub, horizon_days)
+    daily = (
+        wx_fcast.groupby(wx_fcast["time"].dt.date)
+        .agg(temp_avg=("temperature_2m", "mean"),
+             temp_max=("temperature_2m", "max"),
+             temp_low=("temperature_2m", "min"))
+        .reset_index()
+    )
+    daily["time"] = pd.to_datetime(daily["time"])
+    return daily.set_index("time").asfreq("D").iloc[:horizon_days]
+
+
 @tool
 def forecast_lmp(iso: str, horizon_days: int = 7) -> str:
     """
-    Forecast LMP prices for the given ISO based on weather forecasts and
-    historical LMP-weather correlations.
+    Forecast LMP prices for each pricing hub in the given ISO using a
+    per-hub SARIMAX model trained on hub-specific LMP and local weather.
 
     Args:
         iso: Energy market — ERCOT, PJM, or SPP
         horizon_days: Number of days to forecast (max 14)
 
-    Returns predicted daily average and peak LMP with uncertainty note.
+    Returns predicted daily average LMP per hub with 95% confidence intervals.
     """
     horizon_days = min(horizon_days, 14)
     lookback = 45
@@ -270,55 +372,47 @@ def forecast_lmp(iso: str, horizon_days: int = 7) -> str:
     start_hist = (date.today() - timedelta(days=lookback + 1)).isoformat()
 
     try:
-        # 1. Gather historical LMP + weather for model fitting
         lmp_df = lmp_data.get_lmp(iso, start_hist, end_hist)
-        wx_hist = wx_data.weather_for_iso(iso, start_hist, end_hist)
+        hubs   = lmp_df["Location"].unique().tolist()
+        tag    = _source_tag(lmp_df)
 
-        node_df = lmp_df[lmp_df["Location"] == lmp_df["Location"].iloc[0]].copy()
-        node_df["time"] = node_df["Time"].dt.tz_localize(None).dt.floor("h") if node_df["Time"].dt.tz is not None else node_df["Time"].dt.floor("h")
-        wx_hist["time"] = wx_hist["time"].dt.floor("h")
-        merged = node_df.merge(wx_hist, on="time", how="inner")
+        sections = []
+        for hub in hubs:
+            try:
+                merged = _build_hub_merged(lmp_df, hub, iso, start_hist, end_hist)
+                if len(merged) < 48:
+                    sections.append(f"  {hub}: insufficient data")
+                    continue
 
-        if len(merged) < 48:
-            return "Insufficient historical data to build forecast model."
+                arima_result, sigma_base, _, floor = _fit_arima_model(merged)
+                fcast_daily = _build_hub_fcast_daily(iso, hub, horizon_days)
+                log_preds   = _predict_arima(arima_result, fcast_daily)
+                aic         = round(arima_result.aic, 1)
 
-        # 2. Fit model + capture residual std for uncertainty bands
-        coef, sigma_base = _fit_lmp_model(merged)
-
-        # 3. Get weather forecast
-        wx_fcast = wx_data.forecast_for_iso(iso, horizon_days)
-
-        # 4. Predict
-        pred = _predict_lmp(coef, wx_fcast["temperature_2m"].values, wx_fcast["time"])
-        wx_fcast = wx_fcast.copy()
-        wx_fcast["predicted_lmp"] = pred.round(2)
-
-        daily = wx_fcast.groupby(wx_fcast["time"].dt.date).agg(
-            lmp_avg=("predicted_lmp", "mean"),
-            lmp_peak=("predicted_lmp", "max"),
-            lmp_low=("predicted_lmp", "min"),
-            temp_high=("temperature_2m", "max"),
-            temp_low=("temperature_2m", "min"),
-        ).round(2)
-
-        # 5. Uncertainty: 95% CI grows as 1.96 * sigma_base * sqrt(day_index)
-        tag = _source_tag(lmp_df)
-        lines = []
-        for day_idx, (d, r) in enumerate(daily.iterrows(), start=1):
-            ci = round(1.96 * sigma_base * np.sqrt(day_idx), 2)
-            lines.append(
-                f"  Day {day_idx:2d} ({d}): avg ${r.lmp_avg}/MWh  "
-                f"95% CI ±${ci}  "
-                f"range [${round(r.lmp_avg - ci, 2)}, ${round(r.lmp_avg + ci, 2)}]  "
-                f"(temp {r.temp_low}-{r.temp_high}°F)"
-            )
+                lines = [f"  Hub: {hub} | AIC={aic} | sigma={sigma_base:.3f} (log)"]
+                for day_idx, (d, log_pred) in enumerate(
+                        zip(fcast_daily.index, log_preds), start=1):
+                    ci_log   = 1.96 * sigma_base * np.sqrt(day_idx)
+                    avg      = round(float(np.exp(log_pred) + floor), 2)
+                    ci_upper = round(float(np.exp(log_pred + ci_log) + floor), 2)
+                    ci_lower = round(float(np.exp(log_pred - ci_log) + floor), 2)
+                    t_lo     = round(fcast_daily.loc[d, "temp_low"], 1)
+                    t_hi     = round(fcast_daily.loc[d, "temp_max"], 1)
+                    lines.append(
+                        f"    Day {day_idx:2d} ({d.date()}): avg ${avg}/MWh  "
+                        f"95% CI [{ci_lower}, {ci_upper}]  "
+                        f"(temp {t_lo}-{t_hi}°F)"
+                    )
+                sections.append("\n".join(lines))
+            except Exception as hub_err:
+                sections.append(f"  {hub}: error — {hub_err}")
 
         return (
             f"{tag}\n"
-            f"ISO: {iso} | {horizon_days}-Day LMP Forecast\n"
-            f"Model: linear regression | base uncertainty sigma=${sigma_base:.2f}/MWh | "
-            f"CI grows as 1.96*sigma*sqrt(day)\n\n"
-            + "\n".join(lines)
+            f"ISO: {iso} | {horizon_days}-Day LMP Forecast by Hub\n"
+            f"Model: SARIMAX(1,1,1)(1,0,1,7) + shifted-log | "
+            f"hub-specific weather | asymmetric 95% CI\n\n"
+            + "\n\n".join(sections)
             + "\n\n⚠ Uncertainty widens significantly beyond day 5. "
             "Treat as indicative, not as a trading signal."
         )

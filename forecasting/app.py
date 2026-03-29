@@ -312,7 +312,7 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
 
             gr.Examples(
                 examples=[
-                    ["What were ERCOT LMP prices like recently?"],
+                    ["Is PJM at risk for a spike next week?"],
                     ["How does temperature correlate with PJM prices?"],
                     ["Forecast SPP prices for the next 7 days."],
                     ["Compare all three markets for yesterday."],

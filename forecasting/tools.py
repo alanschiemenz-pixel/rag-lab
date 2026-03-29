@@ -164,17 +164,22 @@ def _fit_arima_model(merged: pd.DataFrame):
     return result, sigma_base, daily, floor
 
 
-def _predict_arima(result, wx_fcast: pd.DataFrame) -> np.ndarray:
+def _predict_arima(
+    result, wx_fcast: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Forecast daily LMP using a fitted SARIMAX result.
 
     wx_fcast must have columns: time (date index), CDD_avg, HDD_avg, CDD_max.
-    Returns log-scale predictions — caller must back-transform with
-    np.exp(preds) + floor to get $/MWh values.
+    Returns (log_preds, log_ci_lower, log_ci_upper) — all on the log scale.
+    Caller must back-transform with np.exp(x) + floor to get $/MWh values.
+    CI comes from the model's analytical prediction variance (accounts for AR/MA
+    damping), which grows slower than the manual sigma*sqrt(t) approximation.
     """
     exog_fcast = wx_fcast[["CDD_avg", "HDD_avg", "CDD_max"]]
-    forecast = result.forecast(steps=len(exog_fcast), exog=exog_fcast)
-    return forecast.values  # log scale
+    fc = result.get_forecast(steps=len(exog_fcast), exog=exog_fcast)
+    ci = fc.conf_int(alpha=0.05)
+    return fc.predicted_mean.values, ci.iloc[:, 0].values, ci.iloc[:, 1].values
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
@@ -413,16 +418,15 @@ def forecast_lmp(iso: str, horizon_days: int = 7) -> str:
 
                 arima_result, sigma_base, _, floor = _fit_arima_model(merged)
                 fcast_daily = _build_hub_fcast_daily(iso, hub, horizon_days)
-                log_preds   = _predict_arima(arima_result, fcast_daily)
+                log_preds, log_ci_lo, log_ci_hi = _predict_arima(arima_result, fcast_daily)
                 aic         = round(arima_result.aic, 1)
 
                 lines = [f"  Hub: {hub} | AIC={aic} | sigma={sigma_base:.3f} (log)"]
-                for day_idx, (d, log_pred) in enumerate(
-                        zip(fcast_daily.index, log_preds), start=1):
-                    ci_log   = 1.96 * sigma_base * np.sqrt(day_idx)
+                for day_idx, (d, log_pred, lc_lo, lc_hi) in enumerate(zip(
+                        fcast_daily.index, log_preds, log_ci_lo, log_ci_hi), start=1):
                     avg      = round(float(np.exp(log_pred) + floor), 2)
-                    ci_upper = round(float(np.exp(log_pred + ci_log) + floor), 2)
-                    ci_lower = round(float(np.exp(log_pred - ci_log) + floor), 2)
+                    ci_upper = round(float(np.exp(lc_hi) + floor), 2)
+                    ci_lower = round(float(np.exp(lc_lo) + floor), 2)
                     t_lo     = round(fcast_daily.loc[d, "temp_low"], 1)
                     t_hi     = round(fcast_daily.loc[d, "temp_max"], 1)
                     lines.append(

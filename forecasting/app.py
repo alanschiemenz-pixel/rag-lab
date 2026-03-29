@@ -151,11 +151,18 @@ def run_forecast(iso: str, hub: str, horizon: int):
         mae  = float(np.mean(np.abs(err)))
         aic  = round(arima_result.aic, 1)
 
-        _ex_log = np.log(max(np.mean(y_actual) - floor, 1e-6))
-        ci1_lo  = round(np.exp(_ex_log - 1.96 * sigma_base) + floor, 2)
-        ci1_hi  = round(np.exp(_ex_log + 1.96 * sigma_base) + floor, 2)
-        ci7_lo  = round(np.exp(_ex_log - 1.96 * sigma_base * np.sqrt(7)) + floor, 2)
-        ci7_hi  = round(np.exp(_ex_log + 1.96 * sigma_base * np.sqrt(7)) + floor, 2)
+        # ── Forecast (computed early so CI is available for stats text) ───
+        fcast_daily                     = _build_hub_fcast_daily(iso, hub, horizon)
+        log_preds, log_ci_lo, log_ci_hi = _predict_arima(arima_result, fcast_daily)
+        dates      = fcast_daily.index
+        preds_orig = np.exp(log_preds) + floor
+        ci_upper   = np.exp(log_ci_hi) + floor
+        ci_lower   = np.exp(log_ci_lo) + floor
+
+        ci1_lo = round(float(ci_lower[0]), 2)
+        ci1_hi = round(float(ci_upper[0]), 2)
+        ci7_lo = round(float(ci_lower[min(6, len(ci_lower)-1)]), 2)
+        ci7_hi = round(float(ci_upper[min(6, len(ci_upper)-1)]), 2)
 
         stats_text = (
             f"Hub: {hub} | ISO: {iso}\n"
@@ -239,13 +246,7 @@ def run_forecast(iso: str, hub: str, horizon: int):
         diag_fig.update_yaxes(title_text="Actual ($/MWh)", row=2, col=2)
 
         # ── Forecast figure ───────────────────────────────────────────────
-        fcast_daily = _build_hub_fcast_daily(iso, hub, horizon)
-        log_preds   = _predict_arima(arima_result, fcast_daily)
-        dates       = fcast_daily.index
-        ci_log      = 1.96 * sigma_base * np.sqrt(np.arange(1, len(dates) + 1))
-        preds_orig  = np.exp(log_preds) + floor
-        ci_upper    = np.exp(log_preds + ci_log) + floor
-        ci_lower    = np.exp(log_preds - ci_log) + floor
+        # (forecast already computed above for stats text)
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(

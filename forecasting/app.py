@@ -59,28 +59,24 @@ def handle_chat(message: str, history: list, mock_toggle: bool) -> tuple:
 
 # ── Data Explorer (Tab 2) ─────────────────────────────────────────────────────
 
-def fetch_explorer_data(iso: str, start_date: str, end_date: str):
-    """Fetch LMP + weather and return a table + plotly figure."""
+def fetch_explorer_data(iso: str, hub: str, start_date: str, end_date: str):
+    """Fetch LMP + hub-specific weather and return a table + plotly figure."""
     try:
         lmp_df = lmp_data.get_lmp(iso, start_date, end_date)
-        wx_df  = wx_data.weather_for_iso(iso, start_date, end_date)
+        wx_df  = wx_data.weather_for_hub(iso, hub, start_date, end_date)
     except Exception as e:
         return pd.DataFrame(), None, f"Error: {e}"
 
-    # ── Plotly dual-axis chart ──────────────────────────────────────────
-    # Pivot LMP to first node for the chart
-    node = lmp_df["Location"].iloc[0]
-    node_df = lmp_df[lmp_df["Location"] == node].sort_values("Time")
+    node_df = lmp_df[lmp_df["Location"] == hub].sort_values("Time")
+    if node_df.empty:
+        node_df = lmp_df[lmp_df["Location"] == lmp_df["Location"].iloc[0]].sort_values("Time")
 
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(
         x=node_df["Time"], y=node_df["LMP"],
-        name=f"LMP ({node})", line=dict(color="#2196F3"),
+        name=f"LMP ({hub})", line=dict(color="#2196F3"),
         yaxis="y1",
     ))
-
-    # Align weather to same time axis
     wx_df_sorted = wx_df.sort_values("time")
     fig.add_trace(go.Scatter(
         x=wx_df_sorted["time"], y=wx_df_sorted["temperature_2m"],
@@ -90,7 +86,7 @@ def fetch_explorer_data(iso: str, start_date: str, end_date: str):
 
     source_tag = lmp_df["source"].iloc[0]
     fig.update_layout(
-        title=f"{iso} LMP vs Temperature — {start_date} to {end_date} [{source_tag} data]",
+        title=f"{iso} — {hub} LMP vs Temperature — {start_date} to {end_date} [{source_tag} data]",
         xaxis=dict(title="Time"),
         yaxis=dict(title="LMP ($/MWh)", side="left"),
         yaxis2=dict(title="Temperature (°F)", side="right", overlaying="y",
@@ -100,97 +96,192 @@ def fetch_explorer_data(iso: str, start_date: str, end_date: str):
         template="plotly_white",
     )
 
-    # Summary table (daily averages, all nodes)
-    table_df = lmp_df.groupby(["Location", lmp_df["Time"].dt.date])["LMP"] \
-                     .agg(["mean", "min", "max"]).round(2).reset_index()
-    table_df.columns = ["Node", "Date", "Avg LMP", "Min LMP", "Max LMP"]
+    # Summary table — selected hub only
+    hub_lmp = lmp_df[lmp_df["Location"] == hub] if hub in lmp_df["Location"].values else lmp_df
+    table_df = hub_lmp.groupby(hub_lmp["Time"].dt.date)["LMP"] \
+                      .agg(["mean", "min", "max"]).round(2).reset_index()
+    table_df.columns = ["Date", "Avg LMP", "Min LMP", "Max LMP"]
 
-    return table_df, fig, f"Loaded {len(lmp_df)} rows [{source_tag} data]"
+    return table_df, fig, f"Loaded {len(hub_lmp)} rows for {hub} [{source_tag} data]"
 
 
 # ── Forecast (Tab 3) ──────────────────────────────────────────────────────────
 
-def run_forecast(iso: str, horizon: int):
-    """Run the LMP forecast and return a chart + text summary."""
+def run_forecast(iso: str, hub: str, horizon: int):
+    """Run the LMP forecast for a single hub and return chart, diagnostics, stats, and summary."""
     from tools import forecast_lmp as forecast_tool
 
-    # Call the tool function directly (not through the agent)
     summary_text = forecast_tool.invoke({"iso": iso, "horizon_days": horizon})
 
-    # Also build the chart from raw data
-    try:
-        from datetime import timedelta
-        import numpy as np
-        from data.lmp import get_lmp as _get_lmp
-        from data.weather import forecast_for_iso, weather_for_iso
-        from tools import _fit_lmp_model, _predict_lmp
+    diag_fig   = go.Figure()
+    stats_text = ""
+    fig        = go.Figure()
 
-        lookback = 45
+    try:
+        import numpy as np
+        from plotly.subplots import make_subplots
+        from data.lmp import get_lmp as _get_lmp
+        from tools import _fit_arima_model, _predict_arima, _build_hub_merged, _build_hub_fcast_daily
+
+        BURN_IN    = 8
+        lookback   = 45
         end_hist   = (date.today() - timedelta(days=1)).isoformat()
         start_hist = (date.today() - timedelta(days=lookback + 1)).isoformat()
 
-        lmp_df = _get_lmp(iso, start_hist, end_hist)
-        wx_hist = weather_for_iso(iso, start_hist, end_hist)
-
-        node_df = lmp_df[lmp_df["Location"] == lmp_df["Location"].iloc[0]].copy()
-        node_df["time"] = node_df["Time"].dt.floor("h")
-        wx_hist["time"] = wx_hist["time"].dt.floor("h")
-        merged = node_df.merge(wx_hist, on="time", how="inner")
-
-        coef = _fit_lmp_model(merged)
-
-        wx_fcast = forecast_for_iso(iso, horizon)
-        pred = _predict_lmp(coef, wx_fcast["temperature_2m"].values, wx_fcast["time"])
-
-        daily = wx_fcast.copy()
-        daily["predicted_lmp"] = pred
-
-        daily_agg = daily.groupby(daily["time"].dt.date).agg(
-            lmp_avg=("predicted_lmp", "mean"),
-            lmp_high=("predicted_lmp", "max"),
-            lmp_low=("predicted_lmp", "min"),
-            temp_high=("temperature_2m", "max"),
-        ).reset_index()
-
-        dates = pd.to_datetime(daily_agg["time"])
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=dates, y=daily_agg["lmp_high"],
-            name="Forecast High", line=dict(color="#FF9800"),
-            mode="lines",
-        ))
-        fig.add_trace(go.Scatter(
-            x=dates, y=daily_agg["lmp_avg"],
-            name="Forecast Avg", line=dict(color="#2196F3"),
-            fill="tonexty", fillcolor="rgba(33,150,243,0.1)",
-        ))
-        fig.add_trace(go.Scatter(
-            x=dates, y=daily_agg["lmp_low"],
-            name="Forecast Low", line=dict(color="#4CAF50"),
-            fill="tonexty", fillcolor="rgba(33,150,243,0.05)",
-        ))
-
+        lmp_df     = _get_lmp(iso, start_hist, end_hist)
         source_tag = lmp_df["source"].iloc[0]
-        fig.update_layout(
-            title=f"{iso} {horizon}-Day LMP Forecast [{source_tag} training data]",
-            xaxis_title="Date",
-            yaxis_title="Predicted LMP ($/MWh)",
-            height=420,
-            template="plotly_white",
+
+        merged      = _build_hub_merged(lmp_df, hub, iso, start_hist, end_hist)
+        arima_result, _, daily_train, floor = _fit_arima_model(merged)
+
+        # ── Post-burn-in metrics ──────────────────────────────────────────
+        y_act_full = daily_train["lmp_avg"].values
+        y_fit_full = np.exp(arima_result.fittedvalues.values) + floor
+        res_full   = arima_result.resid.dropna().values
+        min_len    = min(len(y_act_full), len(y_fit_full), len(res_full))
+        y_actual   = y_act_full[-min_len:][BURN_IN:]
+        y_fitted   = y_fit_full[-min_len:][BURN_IN:]
+        residuals  = res_full[-min_len:][BURN_IN:]
+        td         = daily_train.index[-min_len:][BURN_IN:]
+        sigma_base = float(np.std(residuals))
+
+        err  = y_actual - y_fitted
+        r2   = max(0.0, 1 - np.sum(err**2) / np.sum((y_actual - y_actual.mean())**2))
+        rmse = float(np.sqrt(np.mean(err**2)))
+        mae  = float(np.mean(np.abs(err)))
+        aic  = round(arima_result.aic, 1)
+
+        # ── Forecast (computed early so CI is available for stats text) ───
+        fcast_daily                     = _build_hub_fcast_daily(iso, hub, horizon)
+        log_preds, log_ci_lo, log_ci_hi = _predict_arima(arima_result, fcast_daily)
+        dates      = fcast_daily.index
+        preds_orig = np.exp(log_preds) + floor
+        ci_upper   = np.exp(log_ci_hi) + floor
+        ci_lower   = np.exp(log_ci_lo) + floor
+
+        ci1_lo = round(float(ci_lower[0]), 2)
+        ci1_hi = round(float(ci_upper[0]), 2)
+        ci7_lo = round(float(ci_lower[min(6, len(ci_lower)-1)]), 2)
+        ci7_hi = round(float(ci_upper[min(6, len(ci_upper)-1)]), 2)
+
+        stats_text = (
+            f"Hub: {hub} | ISO: {iso}\n"
+            f"Training: {start_hist} to {end_hist}\n"
+            f"Samples: {len(daily_train)} days, {len(y_actual)} post-burn-in "
+            f"(first {BURN_IN} excluded: Kalman warm-up)\n\n"
+            f"Model: SARIMAX(1,1,1)(1,0,1,7) + shifted-log\n"
+            f"  Exogenous: daily avg temp + daily max temp (hub-specific weather)\n"
+            f"  Floor: {floor:.2f} $/MWh  |  Transform: log(LMP - floor)\n\n"
+            f"  Exogenous features (base = 65°F):\n"
+            f"    CDD_avg = max(0, daily_avg_temp - 65)  [cooling demand]\n"
+            f"    HDD_avg = max(0, 65 - daily_avg_temp)  [heating demand]\n"
+            f"    CDD_max = max(0, daily_max_temp - 65)  [peak cooling]\n\n"
+            f"  AIC  = {aic}\n"
+            f"  R²   = {r2:.4f}\n"
+            f"  RMSE = ${rmse:.2f}/MWh\n"
+            f"  MAE  = ${mae:.2f}/MWh\n"
+            f"  σ    = {sigma_base:.4f} (log scale)\n\n"
+            f"Illustrative 95% CI (asymmetric):\n"
+            f"  Day 1:  [{ci1_lo}, {ci1_hi}] $/MWh\n"
+            f"  Day 7:  [{ci7_lo}, {ci7_hi}] $/MWh"
         )
-    except Exception as e:
+
+        # ── Diagnostics figure ────────────────────────────────────────────
+        diag_fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                f"Actual vs Fitted — {hub} ($/MWh)",
+                f"Log-scale Residuals — {hub}",
+                "Residual Distribution (log scale)",
+                "Fitted vs Actual Scatter ($/MWh)",
+            ),
+            vertical_spacing=0.15, horizontal_spacing=0.10,
+        )
+        diag_fig.add_trace(go.Scatter(
+            x=td, y=y_actual, name="Actual",
+            line=dict(color="#FF5722", width=1.5), opacity=0.85,
+        ), row=1, col=1)
+        diag_fig.add_trace(go.Scatter(
+            x=td, y=y_fitted, name="Fitted",
+            line=dict(color="#2196F3", width=1.5), opacity=0.85,
+        ), row=1, col=1)
+        diag_fig.add_trace(go.Scatter(
+            x=td, y=residuals, mode="markers+lines",
+            marker=dict(color="#9C27B0", size=4),
+            line=dict(color="#9C27B0", width=0.5), showlegend=False,
+        ), row=1, col=2)
+        diag_fig.add_hline(y=0, line_color="black", line_dash="dash",
+                           line_width=1, row=1, col=2)
+        diag_fig.add_trace(go.Histogram(
+            x=residuals, nbinsx=20, marker_color="#9C27B0",
+            opacity=0.6, histnorm="probability density", showlegend=False,
+        ), row=2, col=1)
+        x_norm = np.linspace(residuals.min(), residuals.max(), 200)
+        y_norm = (1 / (sigma_base * np.sqrt(2 * np.pi))) * np.exp(
+            -0.5 * (x_norm / sigma_base) ** 2)
+        diag_fig.add_trace(go.Scatter(
+            x=x_norm, y=y_norm,
+            line=dict(color="red", width=2), showlegend=False,
+        ), row=2, col=1)
+        diag_fig.add_trace(go.Scatter(
+            x=y_fitted, y=y_actual, mode="markers",
+            marker=dict(color="#2196F3", size=6, opacity=0.5), showlegend=False,
+        ), row=2, col=2)
+        lim = [min(y_actual.min(), y_fitted.min()), max(y_actual.max(), y_fitted.max())]
+        diag_fig.add_trace(go.Scatter(
+            x=lim, y=lim, mode="lines",
+            line=dict(color="red", dash="dash", width=1), showlegend=False,
+        ), row=2, col=2)
+        diag_fig.update_layout(
+            title=f"{iso} SARIMAX Diagnostics — {hub} [{source_tag}]  AIC={aic}  RMSE=${rmse:.2f}",
+            height=600, template="plotly_white", legend=dict(x=0.01, y=0.99),
+        )
+        diag_fig.update_xaxes(title_text="Date",           row=1, col=1)
+        diag_fig.update_yaxes(title_text="LMP ($/MWh)",    row=1, col=1)
+        diag_fig.update_xaxes(title_text="Date",           row=1, col=2)
+        diag_fig.update_yaxes(title_text="Residual (log)", row=1, col=2)
+        diag_fig.update_xaxes(title_text="Residual (log)", row=2, col=1)
+        diag_fig.update_yaxes(title_text="Density",        row=2, col=1)
+        diag_fig.update_xaxes(title_text="Fitted ($/MWh)", row=2, col=2)
+        diag_fig.update_yaxes(title_text="Actual ($/MWh)", row=2, col=2)
+
+        # ── Forecast figure ───────────────────────────────────────────────
+        # (forecast already computed above for stats text)
+
         fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=dates, y=ci_upper, line=dict(width=0), mode="lines", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=dates, y=ci_lower, name="95% CI", line=dict(width=0),
+            fill="tonexty", fillcolor="rgba(33,150,243,0.15)", mode="lines",
+        ))
+        fig.add_trace(go.Scatter(
+            x=dates, y=preds_orig, name=hub,
+            line=dict(color="#2196F3", width=2), mode="lines+markers",
+        ))
+        fig.update_layout(
+            title=f"{iso} — {hub} {horizon}-Day Forecast [{source_tag} data]",
+            xaxis_title="Date", yaxis_title="Predicted LMP ($/MWh)",
+            height=420, template="plotly_white",
+        )
+
+    except Exception as e:
         fig.add_annotation(text=f"Chart error: {e}", x=0.5, y=0.5,
                            showarrow=False, font=dict(size=14))
+        if not stats_text:
+            stats_text = f"Error: {e}"
 
-    return fig, summary_text
+    return fig, diag_fig, stats_text, summary_text
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
 ISO_CHOICES = ["ERCOT", "PJM", "SPP"]
 default_start, default_end = _default_dates()
+
+def _hub_choices(iso: str) -> list[str]:
+    return config.ISO_NODES.get(iso.upper(), [])
 
 with gr.Blocks(title="LMP Forecasting Assistant") as demo:
     gr.Markdown("## LMP Forecasting Assistant")
@@ -221,7 +312,7 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
 
             gr.Examples(
                 examples=[
-                    ["What were ERCOT LMP prices like recently?"],
+                    ["Is PJM at risk for a spike next week?"],
                     ["How does temperature correlate with PJM prices?"],
                     ["Forecast SPP prices for the next 7 days."],
                     ["Compare all three markets for yesterday."],
@@ -250,17 +341,25 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
             gr.Markdown("### Raw LMP + Weather Data")
             with gr.Row():
                 exp_iso   = gr.Dropdown(ISO_CHOICES, value="ERCOT", label="ISO Market")
+                exp_hub   = gr.Dropdown(_hub_choices("ERCOT"), value=_hub_choices("ERCOT")[0],
+                                        label="Hub")
                 exp_start = gr.Textbox(value=default_start, label="Start Date (YYYY-MM-DD)")
                 exp_end   = gr.Textbox(value=default_end,   label="End Date (YYYY-MM-DD)")
                 fetch_btn = gr.Button("Fetch Data", variant="primary")
 
             exp_status = gr.Textbox(label="Status", interactive=False)
             exp_chart  = gr.Plot(label="LMP vs Temperature")
-            exp_table  = gr.DataFrame(label="Daily LMP Summary by Node")
+            exp_table  = gr.DataFrame(label="Daily LMP Summary")
 
+            exp_iso.change(
+                fn=lambda iso: gr.Dropdown(choices=_hub_choices(iso),
+                                           value=_hub_choices(iso)[0]),
+                inputs=[exp_iso],
+                outputs=[exp_hub],
+            )
             fetch_btn.click(
                 fetch_explorer_data,
-                inputs=[exp_iso, exp_start, exp_end],
+                inputs=[exp_iso, exp_hub, exp_start, exp_end],
                 outputs=[exp_table, exp_chart, exp_status],
             )
 
@@ -268,21 +367,50 @@ with gr.Blocks(title="LMP Forecasting Assistant") as demo:
         with gr.Tab("Price Forecast"):
             gr.Markdown("### Weather-Driven LMP Price Forecast")
             gr.Markdown(
-                "Trains a regression model on 45 days of historical LMP + weather, "
-                "then projects forward using the 14-day Open-Meteo forecast."
+                "**Model: SARIMAX(1,1,1)(1,0,1,7)**\n\n"
+                "Trains a Seasonal ARIMA with eXogenous inputs model on 45 days of "
+                "historical LMP and weather, then projects forward using the 14-day "
+                "Open-Meteo weather forecast.\n\n"
+                "| Component | Meaning |\n"
+                "|---|---|\n"
+                "| AR(1) | Today's price depends on yesterday's price |\n"
+                "| I(1) | First-difference to remove price trend/drift |\n"
+                "| MA(1) | Smooths one lag of forecast error |\n"
+                "| SAR(1), SMA(1) at lag 7 | Weekly demand cycle (Mon–Sun pattern) |\n"
+                "| Exogenous | CDD_avg, HDD_avg, CDD_max (base 65°F) |\n\n"
+                "Uncertainty grows as **1.96 × σ × √day** — a random-walk envelope "
+                "anchored to the model's in-sample residual standard deviation (σ)."
             )
             with gr.Row():
                 fcast_iso     = gr.Dropdown(ISO_CHOICES, value="ERCOT", label="ISO Market")
+                fcast_hub     = gr.Dropdown(_hub_choices("ERCOT"), value=_hub_choices("ERCOT")[0],
+                                            label="Hub")
                 fcast_horizon = gr.Slider(1, 14, value=7, step=1, label="Forecast Horizon (days)")
                 fcast_btn     = gr.Button("Run Forecast", variant="primary")
 
             fcast_chart   = gr.Plot(label="Predicted LMP Range")
+
+            gr.Markdown("#### Model Diagnostics")
+            gr.Markdown(
+                "In-sample fit on daily training data: actual vs fitted LMP, residuals "
+                "over time, residual distribution vs fitted normal (red), and "
+                "fitted-vs-actual scatter. A tight scatter around the diagonal and "
+                "residuals centered on zero indicate a well-specified model."
+            )
+            fcast_diag    = gr.Plot(label="SARIMAX Diagnostics")
+            fcast_stats   = gr.Textbox(label="Model Statistics", lines=12, interactive=False)
             fcast_summary = gr.Textbox(label="Forecast Summary", lines=20, interactive=False)
 
+            fcast_iso.change(
+                fn=lambda iso: gr.Dropdown(choices=_hub_choices(iso),
+                                           value=_hub_choices(iso)[0]),
+                inputs=[fcast_iso],
+                outputs=[fcast_hub],
+            )
             fcast_btn.click(
                 run_forecast,
-                inputs=[fcast_iso, fcast_horizon],
-                outputs=[fcast_chart, fcast_summary],
+                inputs=[fcast_iso, fcast_hub, fcast_horizon],
+                outputs=[fcast_chart, fcast_diag, fcast_stats, fcast_summary],
             )
 
 

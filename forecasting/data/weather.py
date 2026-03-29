@@ -75,15 +75,17 @@ def _mock_weather(lat: float, lon: float, start: date, end: date) -> pd.DataFram
 def _parse_openmeteo(response, start: date, end: date) -> pd.DataFrame:
     """Convert an Open-Meteo response object to a tidy DataFrame."""
     hourly = response.Hourly()
+    # Derive timestamps from the response itself — avoids length mismatches
+    # caused by DST transitions or API rounding of the requested date range.
     hours = pd.date_range(
-        start=pd.Timestamp(start),
-        end=pd.Timestamp(end),
-        freq="h",
+        start=pd.to_datetime(hourly.Time(),    unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(),   unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
         inclusive="left",
-    )
+    ).tz_localize(None)  # drop UTC tz so downstream merges stay tz-naive
     # Variable order must match the request's hourly list
     return pd.DataFrame({
-        "time":           hours[: hourly.Variables(0).ValuesAsNumpy().shape[0]],
+        "time":           hours,
         "temperature_2m": hourly.Variables(0).ValuesAsNumpy().round(1),
         "wind_speed_10m": hourly.Variables(1).ValuesAsNumpy().round(1),
         "precipitation":  hourly.Variables(2).ValuesAsNumpy().round(2),
@@ -181,3 +183,22 @@ def forecast_for_iso(iso: str, forecast_days: int = 14) -> pd.DataFrame:
     """Convenience wrapper: look up coordinates by ISO name."""
     region = config.ISO_REGIONS[iso.upper()]
     return get_forecast_weather(region["lat"], region["lon"], forecast_days)
+
+
+def weather_for_hub(iso: str, hub: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch historical weather for a specific pricing hub's location."""
+    hubs = config.ISO_HUB_LOCATIONS.get(iso.upper(), {})
+    if hub not in hubs:
+        # Fall back to ISO centroid if hub coordinates aren't defined
+        return weather_for_iso(iso, start_date, end_date)
+    loc = hubs[hub]
+    return get_historical_weather(loc["lat"], loc["lon"], start_date, end_date)
+
+
+def forecast_for_hub(iso: str, hub: str, forecast_days: int = 14) -> pd.DataFrame:
+    """Fetch weather forecast for a specific pricing hub's location."""
+    hubs = config.ISO_HUB_LOCATIONS.get(iso.upper(), {})
+    if hub not in hubs:
+        return forecast_for_iso(iso, forecast_days)
+    loc = hubs[hub]
+    return get_forecast_weather(loc["lat"], loc["lon"], forecast_days)
